@@ -10,14 +10,42 @@ import { createClient } from '@supabase/supabase-js';
 // =============================================================================
 // SUPABASE CONFIGURATION
 // =============================================================================
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+const supabaseServiceKey =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
 
 if (!supabaseUrl || !supabaseServiceKey) {
   throw new Error('Missing Supabase environment variables');
 }
 
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+// =============================================================================
+// CORS HELPERS
+// =============================================================================
+const DEFAULT_CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+};
+
+function getCorsHeaders(request: NextRequest): Record<string, string> {
+  const allowList = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
+  const origin = request.headers.get('origin') || '';
+
+  if (allowList.length === 0) {
+    return DEFAULT_CORS_HEADERS;
+  }
+
+  if (origin && allowList.includes(origin)) {
+    return { ...DEFAULT_CORS_HEADERS, 'Access-Control-Allow-Origin': origin };
+  }
+
+  return { ...DEFAULT_CORS_HEADERS, 'Access-Control-Allow-Origin': 'null' };
+}
 
 // =============================================================================
 // MCP PROTOCOL TYPES (Editorial OS Standard)
@@ -78,6 +106,88 @@ type CampaignStatus =
   | 'paused'        // Campaign paused by user
   | 'failed';       // Campaign encountered errors
 
+const VALID_STATUSES = new Set([
+  'intake',
+  'assets_ready',
+  'content_draft',
+  'scheduled',
+  'executing',
+  'tracking',
+  'analyzing',
+  'complete',
+  'paused',
+  'failed'
+]);
+
+const STATUS_ALIASES: Record<string, CampaignStatus> = {
+  draft: 'content_draft',
+  ready: 'assets_ready',
+  assets: 'assets_ready',
+  live: 'executing',
+  analysis: 'analyzing',
+  completed: 'complete'
+};
+
+function isPlainObject(value: any): value is Record<string, any> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function pickParam(params: Record<string, any>, keys: string[]) {
+  for (const key of keys) {
+    const value = params[key];
+    if (value !== undefined && value !== null && value !== '') {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function normalizeChannels(input: any): string[] {
+  if (!input) return [];
+  if (Array.isArray(input)) {
+    return input
+      .map(channel => String(channel).trim())
+      .filter(Boolean);
+  }
+  if (typeof input === 'string') {
+    return input
+      .split(',')
+      .map(channel => channel.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function normalizeStatus(value: any, defaultValue?: CampaignStatus): CampaignStatus | undefined {
+  if (value === undefined || value === null || value === '') {
+    return defaultValue;
+  }
+
+  const raw = String(value).trim().toLowerCase();
+  const alias = STATUS_ALIASES[raw];
+  if (alias) return alias;
+  if (VALID_STATUSES.has(raw)) return raw as CampaignStatus;
+
+  console.warn(`Unknown campaign status "${value}", defaulting to ${defaultValue ?? 'undefined'}`);
+  return defaultValue;
+}
+
+function normalizeLedgerId(params: Record<string, any>): string | undefined {
+  return pickParam(params, ['ledger_id', 'ledgerId', 'campaign_id', 'campaignId', 'id']);
+}
+
+function normalizeMetadata(params: Record<string, any>) {
+  const metadata = pickParam(params, ['metadata', 'meta']);
+  return isPlainObject(metadata) ? metadata : {};
+}
+
+function requireParam<T>(value: T | undefined | null, label: string, action: string): T {
+  if (value === undefined || value === null || value === '') {
+    throw new Error(`Missing required "${label}" for ${action}.`);
+  }
+  return value;
+}
+
 // =============================================================================
 // CORE EDITORIAL OS MCP ACTIONS
 // =============================================================================
@@ -135,19 +245,27 @@ export async function POST(request: NextRequest): Promise<NextResponse<McpRespon
   
   try {
     const body: McpRequest = await request.json();
-    const { action, params = {} } = body;
+    const action = typeof body?.action === 'string' ? body.action.trim() : '';
+    const params = isPlainObject(body?.params) ? body.params : {};
 
     console.log(`🎯 Ledger MCP: ${action}`, params);
 
     // Route to core or extended actions
     const handler = (CORE_MCP_ACTIONS as any)[action] || (EXTENDED_MCP_ACTIONS as any)[action];
     
+    if (!action) {
+      return NextResponse.json({
+        success: false,
+        error: 'Missing required "action" in MCP request.'
+      }, { status: 400, headers: getCorsHeaders(request) });
+    }
+
     if (!handler) {
       const availableActions = [...Object.keys(CORE_MCP_ACTIONS), ...Object.keys(EXTENDED_MCP_ACTIONS)];
       return NextResponse.json({
         success: false,
         error: `Unknown action: ${action}. Available actions: ${availableActions.join(', ')}`
-      }, { status: 400 });
+      }, { status: 400, headers: getCorsHeaders(request) });
     }
 
     // Execute the action
@@ -159,7 +277,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<McpRespon
     return NextResponse.json({
       success: true,
       data: result
-    });
+    }, { headers: getCorsHeaders(request) });
 
   } catch (error: any) {
     const duration = Date.now() - startTime;
@@ -168,14 +286,14 @@ export async function POST(request: NextRequest): Promise<NextResponse<McpRespon
     return NextResponse.json({
       success: false,
       error: error.message || 'Internal server error'
-    }, { status: 500 });
+    }, { status: 500, headers: getCorsHeaders(request) });
   }
 }
 
 // =============================================================================
 // HEALTH CHECK ENDPOINT
 // =============================================================================
-export async function GET() {
+export async function GET(request: NextRequest) {
   return NextResponse.json({
     success: true,
     service: 'editorial-os-ledger',
@@ -187,6 +305,13 @@ export async function GET() {
     database: 'supabase',
     levels_supported: [3, 4, 5],
     timestamp: new Date().toISOString()
+  }, { headers: getCorsHeaders(request) });
+}
+
+export async function OPTIONS(request: NextRequest) {
+  return new NextResponse(null, {
+    status: 204,
+    headers: getCorsHeaders(request)
   });
 }
 
@@ -196,20 +321,38 @@ export async function GET() {
 
 // Campaign Creation (Level 2-3)
 async function handleCreateCampaign(params: any): Promise<Campaign> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const projectName = pickParam(safeParams, [
+    'project_name',
+    'projectName',
+    'campaign_name',
+    'campaignName',
+    'name',
+    'title'
+  ]);
+  const briefId = pickParam(safeParams, ['brief_id', 'briefId']);
+  const statusInput = pickParam(safeParams, ['status', 'campaign_status', 'campaignStatus']);
+  const ownerName = pickParam(safeParams, ['owner_name', 'ownerName']);
+  const ownerEmail = pickParam(safeParams, ['owner_email', 'ownerEmail']);
+  const channelsInput = pickParam(safeParams, ['channels', 'channel', 'channel_list', 'channelList']);
+  const metadata = normalizeMetadata(safeParams);
+
+  const projectNameValue = requireParam(projectName, 'project_name', 'create_campaign');
+
   const ledger_id = `LED-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
   const now = new Date().toISOString();
   
   const campaign: Campaign = {
     ledger_id,
-    project_name: params.project_name,
-    brief_id: params.brief_id || null,
-    status: params.status || 'intake',
-    owner_name: params.owner_name || null,
-    owner_email: params.owner_email || null,
-    channels: params.channels || [],
+    project_name: projectNameValue,
+    brief_id: briefId || null,
+    status: normalizeStatus(statusInput, 'intake') || 'intake',
+    owner_name: ownerName || null,
+    owner_email: ownerEmail || null,
+    channels: normalizeChannels(channelsInput),
     created_at: now,
     updated_at: now,
-    metadata: params.metadata || {}
+    metadata
   };
 
   const { data, error } = await supabase
@@ -222,8 +365,8 @@ async function handleCreateCampaign(params: any): Promise<Campaign> {
 
   // Log creation event for timeline
   await logCampaignEvent(ledger_id, 'campaign_created', 'orchestrator', {
-    project_name: params.project_name,
-    channels: params.channels
+    project_name: campaign.project_name,
+    channels: campaign.channels
   });
 
   return data;
@@ -231,6 +374,9 @@ async function handleCreateCampaign(params: any): Promise<Campaign> {
 
 // Campaign Retrieval
 async function handleGetCampaign(params: any): Promise<Campaign> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'get_campaign');
+
   const { data, error } = await supabase
     .from('campaigns')
     .select(`
@@ -239,7 +385,7 @@ async function handleGetCampaign(params: any): Promise<Campaign> {
       campaign_metrics(*),
       campaign_assets(*)
     `)
-    .eq('ledger_id', params.ledger_id)
+    .eq('ledger_id', ledgerId)
     .single();
 
   if (error) throw new Error(`Campaign not found: ${error.message}`);
@@ -248,17 +394,22 @@ async function handleGetCampaign(params: any): Promise<Campaign> {
 
 // Campaign Listing
 async function handleListCampaigns(params: any): Promise<Campaign[]> {
+  const safeParams = isPlainObject(params) ? params : {};
   let query = supabase
     .from('campaigns')
     .select('*')
     .order('created_at', { ascending: false });
 
-  if (params.status) {
-    query = query.eq('status', params.status);
+  const statusInput = pickParam(safeParams, ['status', 'campaign_status', 'campaignStatus']);
+  const status = normalizeStatus(statusInput);
+  if (status) {
+    query = query.eq('status', status);
   }
 
-  if (params.limit) {
-    query = query.limit(params.limit);
+  const limitInput = pickParam(safeParams, ['limit', 'page_size', 'pageSize']);
+  const limitValue = Number(limitInput);
+  if (Number.isFinite(limitValue) && limitValue > 0) {
+    query = query.limit(limitValue);
   }
 
   const { data, error } = await query;
@@ -268,26 +419,43 @@ async function handleListCampaigns(params: any): Promise<Campaign[]> {
 
 // Status Updates (Agent Coordination)
 async function handleUpdateStatus(params: any): Promise<Campaign> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'update_status');
+  const statusInput = pickParam(safeParams, [
+    'status',
+    'next_status',
+    'nextStatus',
+    'new_status',
+    'newStatus',
+    'campaign_status',
+    'campaignStatus'
+  ]);
+  const status = requireParam(normalizeStatus(statusInput), 'status', 'update_status');
+  const previousStatus = pickParam(safeParams, ['previous_status', 'previousStatus']);
+  const agent = pickParam(safeParams, ['agent', 'agent_name', 'agentName', 'actor']) || 'system';
+  const reason = pickParam(safeParams, ['reason', 'status_reason', 'statusReason']);
+  const metadata = normalizeMetadata(safeParams);
+  const metadataUpdate = Object.keys(metadata).length > 0 ? metadata : undefined;
   const now = new Date().toISOString();
   
   const { data, error } = await supabase
     .from('campaigns')
     .update({ 
-      status: params.status, 
+      status, 
       updated_at: now,
-      metadata: params.metadata || undefined
+      metadata: metadataUpdate
     })
-    .eq('ledger_id', params.ledger_id)
+    .eq('ledger_id', ledgerId)
     .select()
     .single();
 
   if (error) throw new Error(`Failed to update status: ${error.message}`);
 
   // Log status change event
-  await logCampaignEvent(params.ledger_id, 'status_changed', params.agent || 'system', {
-    from: params.previous_status,
-    to: params.status,
-    reason: params.reason
+  await logCampaignEvent(ledgerId, 'status_changed', agent, {
+    from: previousStatus,
+    to: status,
+    reason
   });
 
   return data;
@@ -295,10 +463,12 @@ async function handleUpdateStatus(params: any): Promise<Campaign> {
 
 // Campaign Deletion
 async function handleDeleteCampaign(params: any): Promise<{ deleted: boolean }> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'delete_campaign');
   const { error } = await supabase
     .from('campaigns')
     .delete()
-    .eq('ledger_id', params.ledger_id);
+    .eq('ledger_id', ledgerId);
 
   if (error) throw new Error(`Failed to delete campaign: ${error.message}`);
   return { deleted: true };
@@ -306,21 +476,37 @@ async function handleDeleteCampaign(params: any): Promise<{ deleted: boolean }> 
 
 // Agent Action Logging (Level 3-5 Coordination)
 async function handleLogAgentAction(params: any): Promise<{ logged: boolean }> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'log_agent_action');
+  const actionType = requireParam(
+    pickParam(safeParams, ['action_type', 'actionType', 'event_type', 'eventType']),
+    'action_type',
+    'log_agent_action'
+  );
+  const agentName = requireParam(
+    pickParam(safeParams, ['agent_name', 'agentName', 'agent', 'actor']),
+    'agent_name',
+    'log_agent_action'
+  );
+  const actionData = pickParam(safeParams, ['action_data', 'actionData', 'payload']) || {};
+
   await logCampaignEvent(
-    params.ledger_id,
-    params.action_type,
-    params.agent_name,
-    params.action_data
+    ledgerId,
+    actionType,
+    agentName,
+    actionData
   );
   return { logged: true };
 }
 
 // Campaign Timeline
 async function handleGetCampaignTimeline(params: any): Promise<any[]> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'get_campaign_timeline');
   const { data, error } = await supabase
     .from('campaign_events')
     .select('*')
-    .eq('ledger_id', params.ledger_id)
+    .eq('ledger_id', ledgerId)
     .order('created_at', { ascending: true });
 
   if (error) throw new Error(`Failed to get timeline: ${error.message}`);
@@ -329,37 +515,82 @@ async function handleGetCampaignTimeline(params: any): Promise<any[]> {
 
 // Execution Progress Updates
 async function handleUpdateExecutionProgress(params: any): Promise<{ updated: boolean }> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'update_execution_progress');
+  const progressDataRaw = pickParam(safeParams, ['progress_data', 'progressData', 'metadata']);
+  const progressData = isPlainObject(progressDataRaw)
+    ? progressDataRaw
+    : progressDataRaw
+      ? { value: progressDataRaw }
+      : {};
+  const agent = pickParam(safeParams, ['agent', 'agent_name', 'agentName', 'actor']) || 'system';
   const now = new Date().toISOString();
   
   const { error } = await supabase
     .from('campaigns')
     .update({ 
-      metadata: params.progress_data,
+      metadata: progressData,
       updated_at: now
     })
-    .eq('ledger_id', params.ledger_id);
+    .eq('ledger_id', ledgerId);
 
   if (error) throw new Error(`Failed to update progress: ${error.message}`);
 
   // Log progress event
-  await logCampaignEvent(params.ledger_id, 'progress_update', params.agent, params.progress_data);
+  await logCampaignEvent(ledgerId, 'progress_update', agent, progressData);
   
   return { updated: true };
 }
 
 // Performance Metrics Storage (Level 4-5)
 async function handleStoreMetrics(params: any): Promise<{ stored: boolean }> {
-  const metrics = Array.isArray(params.metrics) ? params.metrics : [params];
-  
-  const metricsToInsert = metrics.map(metric => ({
-    ledger_id: params.ledger_id || metric.ledger_id,
-    metric_type: metric.metric_type,
-    value: metric.value,
-    source: metric.source,
-    tracked_at: new Date().toISOString(),
-    campaign_date: metric.campaign_date || params.campaign_date,
-    metadata: metric.metadata
-  }));
+  const safeParams = isPlainObject(params) ? params : {};
+  const metricsInput = Array.isArray(safeParams.metrics)
+    ? safeParams.metrics
+    : safeParams.metrics
+      ? [safeParams.metrics]
+      : [safeParams];
+  const fallbackLedgerId = normalizeLedgerId(safeParams);
+  const fallbackSource = pickParam(safeParams, ['source', 'metric_source', 'metricSource']);
+  const fallbackCampaignDate = pickParam(safeParams, ['campaign_date', 'campaignDate']);
+
+  const metricsToInsert = metricsInput.map(metric => {
+    const metricParams = isPlainObject(metric) ? metric : {};
+    const ledgerId = requireParam(
+      normalizeLedgerId(metricParams) || fallbackLedgerId,
+      'ledger_id',
+      'store_metrics'
+    );
+    const metricType = requireParam(
+      pickParam(metricParams, ['metric_type', 'metricType', 'type']) ||
+        pickParam(safeParams, ['metric_type', 'metricType', 'type']),
+      'metric_type',
+      'store_metrics'
+    );
+    const rawValue = pickParam(metricParams, ['value', 'metric_value', 'metricValue']);
+    const value = Number(rawValue);
+    if (!Number.isFinite(value)) {
+      throw new Error('value must be a number for store_metrics.');
+    }
+    const source = requireParam(
+      pickParam(metricParams, ['source', 'metric_source', 'metricSource']) || fallbackSource,
+      'source',
+      'store_metrics'
+    );
+    const campaignDate =
+      pickParam(metricParams, ['campaign_date', 'campaignDate']) || fallbackCampaignDate;
+    const metadata = normalizeMetadata(metricParams);
+
+    return {
+      ledger_id: ledgerId,
+      metric_type: metricType,
+      value,
+      source,
+      tracked_at: new Date().toISOString(),
+      campaign_date: campaignDate,
+      metadata
+    };
+  });
 
   const { error } = await supabase
     .from('campaign_metrics')
@@ -368,24 +599,30 @@ async function handleStoreMetrics(params: any): Promise<{ stored: boolean }> {
   if (error) throw new Error(`Failed to store metrics: ${error.message}`);
 
   // Log metrics stored event
-  await logCampaignEvent(params.ledger_id, 'metrics_stored', params.source, {
-    metrics_count: metricsToInsert.length,
-    metric_types: metricsToInsert.map(m => m.metric_type)
-  });
+  const primaryLedgerId = fallbackLedgerId || metricsToInsert[0]?.ledger_id;
+  if (primaryLedgerId) {
+    await logCampaignEvent(primaryLedgerId, 'metrics_stored', metricsToInsert[0]?.source || 'metrics', {
+      metrics_count: metricsToInsert.length,
+      metric_types: metricsToInsert.map(m => m.metric_type)
+    });
+  }
 
   return { stored: true };
 }
 
 // Metrics Retrieval
 async function handleGetMetrics(params: any): Promise<CampaignMetrics[]> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'get_metrics');
   let query = supabase
     .from('campaign_metrics')
     .select('*')
-    .eq('ledger_id', params.ledger_id)
+    .eq('ledger_id', ledgerId)
     .order('tracked_at', { ascending: false });
 
-  if (params.metric_type) {
-    query = query.eq('metric_type', params.metric_type);
+  const metricType = pickParam(safeParams, ['metric_type', 'metricType', 'type']);
+  if (metricType) {
+    query = query.eq('metric_type', metricType);
   }
 
   const { data, error } = await query;
@@ -395,15 +632,23 @@ async function handleGetMetrics(params: any): Promise<CampaignMetrics[]> {
 
 // Performance History (Level 5 Learning)
 async function handleGetPerformanceHistory(params: any): Promise<any> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const metricType = requireParam(
+    pickParam(safeParams, ['metric_type', 'metricType', 'type']),
+    'metric_type',
+    'get_performance_history'
+  );
+  const limitInput = pickParam(safeParams, ['limit', 'page_size', 'pageSize']);
+  const limitValue = Number(limitInput);
   const { data, error } = await supabase
     .from('campaign_metrics')
     .select(`
       *,
       campaigns(project_name, channels, status)
     `)
-    .eq('metric_type', params.metric_type)
+    .eq('metric_type', metricType)
     .order('tracked_at', { ascending: false })
-    .limit(params.limit || 50);
+    .limit(Number.isFinite(limitValue) && limitValue > 0 ? limitValue : 50);
 
   if (error) throw new Error(`Failed to get performance history: ${error.message}`);
   
@@ -426,22 +671,27 @@ async function handleGetPerformanceHistory(params: any): Promise<any> {
 
 // Learned Patterns (Level 5 Intelligence)
 async function handleGetLearnedPatterns(params: any): Promise<LearnedPattern[]> {
+  const safeParams = isPlainObject(params) ? params : {};
   let query = supabase
     .from('learned_patterns')
     .select('*')
     .eq('is_active', true)
     .order('confidence_level', { ascending: false });
 
-  if (params.agent_name) {
-    query = query.eq('agent_name', params.agent_name);
+  const agentName = pickParam(safeParams, ['agent_name', 'agentName', 'agent']);
+  if (agentName) {
+    query = query.eq('agent_name', agentName);
   }
 
-  if (params.pattern_type) {
-    query = query.eq('pattern_type', params.pattern_type);
+  const patternType = pickParam(safeParams, ['pattern_type', 'patternType', 'type']);
+  if (patternType) {
+    query = query.eq('pattern_type', patternType);
   }
 
-  if (params.min_confidence) {
-    query = query.gte('confidence_level', params.min_confidence);
+  const minConfidenceInput = pickParam(safeParams, ['min_confidence', 'minConfidence']);
+  const minConfidenceValue = Number(minConfidenceInput);
+  if (Number.isFinite(minConfidenceValue)) {
+    query = query.gte('confidence_level', minConfidenceValue);
   }
 
   const { data, error } = await query;
@@ -451,15 +701,46 @@ async function handleGetLearnedPatterns(params: any): Promise<LearnedPattern[]> 
 
 // Store Learned Pattern
 async function handleStoreLearnedPattern(params: any): Promise<LearnedPattern> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const agentName = requireParam(
+    pickParam(safeParams, ['agent_name', 'agentName', 'agent']),
+    'agent_name',
+    'store_learned_pattern'
+  );
+  const patternType = requireParam(
+    pickParam(safeParams, ['pattern_type', 'patternType', 'type']),
+    'pattern_type',
+    'store_learned_pattern'
+  );
+  const patternRule = requireParam(
+    pickParam(safeParams, ['pattern_rule', 'patternRule', 'rule']),
+    'pattern_rule',
+    'store_learned_pattern'
+  );
+  const confidenceInput = pickParam(safeParams, [
+    'confidence_level',
+    'confidenceLevel',
+    'confidence'
+  ]);
+  const confidenceValue = Number(confidenceInput);
+  if (!Number.isFinite(confidenceValue) || confidenceValue < 0 || confidenceValue > 1) {
+    throw new Error('confidence_level must be a number between 0 and 1.');
+  }
+  const sampleInput = pickParam(safeParams, ['sample_size', 'sampleSize', 'samples']);
+  const sampleSizeValue = Number(sampleInput);
+  if (!Number.isFinite(sampleSizeValue) || sampleSizeValue <= 0) {
+    throw new Error('sample_size must be a positive number.');
+  }
+
   const pattern_id = `PAT-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
   
   const pattern: LearnedPattern = {
     pattern_id,
-    agent_name: params.agent_name,
-    pattern_type: params.pattern_type,
-    pattern_rule: params.pattern_rule,
-    confidence_level: params.confidence_level,
-    sample_size: params.sample_size,
+    agent_name: agentName,
+    pattern_type: patternType,
+    pattern_rule: patternRule,
+    confidence_level: confidenceValue,
+    sample_size: sampleSizeValue,
     learned_at: new Date().toISOString(),
     is_active: true
   };
@@ -476,13 +757,34 @@ async function handleStoreLearnedPattern(params: any): Promise<LearnedPattern> {
 
 // Update Pattern Confidence
 async function handleUpdatePatternConfidence(params: any): Promise<LearnedPattern> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const patternId = requireParam(
+    pickParam(safeParams, ['pattern_id', 'patternId', 'id']),
+    'pattern_id',
+    'update_pattern_confidence'
+  );
+  const confidenceInput = pickParam(safeParams, [
+    'confidence_level',
+    'confidenceLevel',
+    'confidence'
+  ]);
+  const confidenceValue = Number(confidenceInput);
+  if (!Number.isFinite(confidenceValue) || confidenceValue < 0 || confidenceValue > 1) {
+    throw new Error('confidence_level must be a number between 0 and 1.');
+  }
+  const sampleInput = pickParam(safeParams, ['sample_size', 'sampleSize', 'samples']);
+  const sampleSizeValue = Number(sampleInput);
+  if (!Number.isFinite(sampleSizeValue) || sampleSizeValue <= 0) {
+    throw new Error('sample_size must be a positive number.');
+  }
+
   const { data, error } = await supabase
     .from('learned_patterns')
     .update({
-      confidence_level: params.confidence_level,
-      sample_size: params.sample_size
+      confidence_level: confidenceValue,
+      sample_size: sampleSizeValue
     })
-    .eq('pattern_id', params.pattern_id)
+    .eq('pattern_id', patternId)
     .select()
     .single();
 
@@ -492,8 +794,12 @@ async function handleUpdatePatternConfidence(params: any): Promise<LearnedPatter
 
 // VP Report Data Generation (Level 5)
 async function handleGenerateReportData(params: any): Promise<any> {
-  const endDate = params.end_date || new Date().toISOString();
-  const startDate = params.start_date || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const safeParams = isPlainObject(params) ? params : {};
+  const endDate =
+    pickParam(safeParams, ['end_date', 'endDate']) || new Date().toISOString();
+  const startDate =
+    pickParam(safeParams, ['start_date', 'startDate']) ||
+    new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
   // Get campaigns in date range
   const { data: campaigns } = await supabase
@@ -533,14 +839,31 @@ async function handleWeeklySummary(params: any): Promise<any> {
 
 // Asset Management
 async function handleAttachAsset(params: any): Promise<{ attached: boolean }> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'attach_asset');
+  const assetId = requireParam(
+    pickParam(safeParams, ['asset_id', 'assetId', 'id']),
+    'asset_id',
+    'attach_asset'
+  );
+  const assetUrl = pickParam(safeParams, ['asset_url', 'assetUrl', 'url']);
+  const assetType = pickParam(safeParams, ['asset_type', 'assetType', 'type']);
+  const channels = normalizeChannels(
+    pickParam(safeParams, ['channels', 'channel', 'channel_list', 'channelList'])
+  );
+  const attachedBy =
+    pickParam(safeParams, ['attached_by', 'attachedBy', 'agent', 'agent_name']) || 'dam-agent';
+  const metadata = normalizeMetadata(safeParams);
+
   const asset = {
-    ledger_id: params.ledger_id,
-    asset_id: params.asset_id,
-    asset_url: params.asset_url,
-    asset_type: params.asset_type,
-    channels: params.channels,
+    ledger_id: ledgerId,
+    asset_id: assetId,
+    asset_url: assetUrl,
+    asset_type: assetType,
+    channels,
     attached_at: new Date().toISOString(),
-    attached_by: params.attached_by || 'dam-agent'
+    attached_by: attachedBy,
+    metadata
   };
 
   const { error } = await supabase
@@ -549,17 +872,19 @@ async function handleAttachAsset(params: any): Promise<{ attached: boolean }> {
 
   if (error) throw new Error(`Failed to attach asset: ${error.message}`);
 
-  await logCampaignEvent(params.ledger_id, 'asset_attached', 'dam-agent', asset);
+  await logCampaignEvent(ledgerId, 'asset_attached', attachedBy, asset);
   
   return { attached: true };
 }
 
 // List Assets
 async function handleListAssets(params: any): Promise<any[]> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'list_assets');
   const { data, error } = await supabase
     .from('campaign_assets')
     .select('*')
-    .eq('ledger_id', params.ledger_id)
+    .eq('ledger_id', ledgerId)
     .order('attached_at', { ascending: false });
 
   if (error) throw new Error(`Failed to list assets: ${error.message}`);
@@ -568,15 +893,23 @@ async function handleListAssets(params: any): Promise<any[]> {
 
 // External Tool Integration
 async function handleLogExternalExecution(params: any): Promise<{ logged: boolean }> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'log_external_execution');
+  const toolName = pickParam(safeParams, ['tool_name', 'toolName', 'tool']) || 'external-tool';
+  const externalId = pickParam(safeParams, ['external_id', 'externalId']);
+  const externalUrl = pickParam(safeParams, ['external_url', 'externalUrl', 'url']);
+  const executionStatus = pickParam(safeParams, ['status', 'execution_status', 'executionStatus']);
+  const executionData = pickParam(safeParams, ['execution_data', 'executionData', 'payload']);
+
   await logCampaignEvent(
-    params.ledger_id,
+    ledgerId,
     'external_execution',
-    params.tool_name,
+    toolName,
     {
-      external_id: params.external_id,
-      external_url: params.external_url,
-      execution_status: params.status,
-      execution_data: params.execution_data
+      external_id: externalId,
+      external_url: externalUrl,
+      execution_status: executionStatus,
+      execution_data: executionData
     }
   );
   return { logged: true };
@@ -584,21 +917,32 @@ async function handleLogExternalExecution(params: any): Promise<{ logged: boolea
 
 // Sync External Status
 async function handleSyncExternalStatus(params: any): Promise<{ synced: boolean }> {
+  const safeParams = isPlainObject(params) ? params : {};
+  const ledgerId = requireParam(normalizeLedgerId(safeParams), 'ledger_id', 'sync_external_status');
+  const currentMetadataRaw = pickParam(safeParams, ['current_metadata', 'currentMetadata', 'metadata']);
+  const currentMetadata = isPlainObject(currentMetadataRaw) ? currentMetadataRaw : {};
+  const externalStatus = requireParam(
+    pickParam(safeParams, ['external_status', 'externalStatus', 'status']),
+    'external_status',
+    'sync_external_status'
+  );
+  const toolName = pickParam(safeParams, ['tool_name', 'toolName', 'tool']) || 'external-tool';
+
   // Update campaign with external tool status
   const { error } = await supabase
     .from('campaigns')
     .update({ 
       metadata: { 
-        ...params.current_metadata,
-        external_status: params.external_status,
+        ...currentMetadata,
+        external_status: externalStatus,
         last_sync: new Date().toISOString()
       }
     })
-    .eq('ledger_id', params.ledger_id);
+    .eq('ledger_id', ledgerId);
 
   if (error) throw new Error(`Failed to sync external status: ${error.message}`);
 
-  await logCampaignEvent(params.ledger_id, 'external_sync', params.tool_name, params.external_status);
+  await logCampaignEvent(ledgerId, 'external_sync', toolName, externalStatus);
   
   return { synced: true };
 }
