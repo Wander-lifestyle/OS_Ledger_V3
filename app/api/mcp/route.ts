@@ -139,7 +139,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<McpRespon
     console.log(`🎯 Ledger MCP: ${action}`, params);
 
     // Route to core or extended actions
-    const handler = CORE_MCP_ACTIONS[action] || EXTENDED_MCP_ACTIONS[action];
+  const handler = (CORE_MCP_ACTIONS as any)[action] || (EXTENDED_MCP_ACTIONS as any)[action];
     
     if (!handler) {
       const availableActions = [...Object.keys(CORE_MCP_ACTIONS), ...Object.keys(EXTENDED_MCP_ACTIONS)];
