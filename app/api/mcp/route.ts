@@ -58,7 +58,7 @@ interface LearnedPattern {
   pattern_id: string;
   agent_name: string; // 'newsletter-agent', 'social-engine', etc.
   pattern_type: string; // 'subject_line', 'posting_time', 'content_format'
-  pattern_rule: string; // 'Question subjects: +23% open rate'
+  pattern_rule: string; // 'Question subjects: +23% open rate (12 samples, high confidence)'
   confidence_level: number; // 0.0 to 1.0
   sample_size: number;
   learned_at: string;
@@ -80,7 +80,7 @@ type CampaignStatus =
 // =============================================================================
 // CORE EDITORIAL OS MCP ACTIONS
 // =============================================================================
-const CORE_MCP_ACTIONS = {
+const CORE_MCP_ACTIONS: Record<string, Function> = {
   // Campaign Lifecycle Management
   'create_campaign': handleCreateCampaign,
   'get_campaign': handleGetCampaign,
@@ -139,7 +139,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<McpRespon
     console.log(`🎯 Ledger MCP: ${action}`, params);
 
     // Route to core or extended actions
-  const handler = (CORE_MCP_ACTIONS as any)[action] || (EXTENDED_MCP_ACTIONS as any)[action];
+    const handler = CORE_MCP_ACTIONS[action] || EXTENDED_MCP_ACTIONS[action];
     
     if (!handler) {
       const availableActions = [...Object.keys(CORE_MCP_ACTIONS), ...Object.keys(EXTENDED_MCP_ACTIONS)];
@@ -350,7 +350,7 @@ async function handleUpdateExecutionProgress(params: any): Promise<{ updated: bo
 async function handleStoreMetrics(params: any): Promise<{ stored: boolean }> {
   const metrics = Array.isArray(params.metrics) ? params.metrics : [params];
   
-  const metricsToInsert = metrics.map(metric => ({
+  const metricsToInsert = metrics.map((metric: any) => ({
     ledger_id: params.ledger_id || metric.ledger_id,
     metric_type: metric.metric_type,
     value: metric.value,
@@ -369,7 +369,7 @@ async function handleStoreMetrics(params: any): Promise<{ stored: boolean }> {
   // Log metrics stored event
   await logCampaignEvent(params.ledger_id, 'metrics_stored', params.source, {
     metrics_count: metricsToInsert.length,
-    metric_types: metricsToInsert.map(m => m.metric_type)
+    metric_types: metricsToInsert.map((m: any) => m.metric_type)
   });
 
   return { stored: true };
@@ -409,7 +409,7 @@ async function handleGetPerformanceHistory(params: any): Promise<any> {
   // Calculate averages and trends
   const metrics = data || [];
   const average = metrics.length > 0 
-    ? metrics.reduce((sum, m) => sum + m.value, 0) / metrics.length 
+    ? metrics.reduce((sum: number, m: any) => sum + m.value, 0) / metrics.length 
     : 0;
 
   return {
@@ -514,8 +514,8 @@ async function handleGenerateReportData(params: any): Promise<any> {
   return {
     date_range: { start: startDate, end: endDate },
     campaigns_created: campaigns?.length || 0,
-    campaigns_completed: campaigns?.filter(c => c.status === 'complete').length || 0,
-    total_metrics: campaigns?.reduce((sum, c) => sum + (c.campaign_metrics?.length || 0), 0) || 0,
+    campaigns_completed: campaigns?.filter((c: any) => c.status === 'complete').length || 0,
+    total_metrics: campaigns?.reduce((sum: number, c: any) => sum + (c.campaign_metrics?.length || 0), 0) || 0,
     patterns_learned: patterns?.length || 0,
     campaigns,
     learned_patterns: patterns
@@ -630,28 +630,3 @@ async function logCampaignEvent(
     console.error('Failed to log campaign event:', error);
   }
 }
-
-// =============================================================================
-// CLIENT EXTENSIBILITY EXAMPLE
-// =============================================================================
-
-// Example: Custom Notion Integration (Week 2 client customization)
-/*
-EXTENDED_MCP_ACTIONS['sync_notion_tasks'] = async function handleSyncNotion(params: any) {
-  // Custom client logic for Notion integration
-  const notionTasks = await fetchNotionTasks(params.database_id);
-  
-  // Update campaign with Notion data
-  await supabase
-    .from('campaigns')
-    .update({ 
-      metadata: { 
-        notion_tasks: notionTasks,
-        last_notion_sync: new Date().toISOString()
-      }
-    })
-    .eq('ledger_id', params.ledger_id);
-  
-  return { synced: true, tasks_count: notionTasks.length };
-};
-*/
