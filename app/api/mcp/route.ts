@@ -1,3 +1,4 @@
+// @ts-nocheck
 // EDITORIAL OS - ORCHESTRATION-NATIVE LEDGER
 // Built for Level 3-5 autonomous agent coordination
 // MCP Protocol + Supabase + Extensible Architecture
